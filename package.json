@@ -1,5 +1,5 @@
 {
-  "name": "@denovo/irehab-mcp-server",
+  "name": "irehab-mcp-server",
   "version": "1.0.0",
   "description": "MCP Server for iRehab — physician AI tools access to rehab patient data",
   "type": "module",
