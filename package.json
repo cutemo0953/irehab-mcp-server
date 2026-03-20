@@ -1,0 +1,18 @@
+{
+  "name": "@denovo/irehab-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP Server for iRehab — physician AI tools access to rehab patient data",
+  "type": "module",
+  "bin": {
+    "irehab-mcp": "./src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "keywords": ["mcp", "irehab", "medical", "rehabilitation", "ai"],
+  "author": "De Novo Orthopedics",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1"
+  }
+}
