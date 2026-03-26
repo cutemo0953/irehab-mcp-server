@@ -40,8 +40,30 @@ async function apiCall(path) {
   return res.json();
 }
 
+async function apiWrite(path, method, body) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method,
+    headers: {
+      'Authorization': `Bearer ${API_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  if (res.status === 403) throw new Error('Insufficient scope. Enable write permissions in Doctor PWA Profile.');
+  if (res.status === 409) throw new Error('Draft collision: existing draft pending. Confirm or delete it in Doctor PWA first.');
+  if (res.status === 429) {
+    const retryAfter = res.headers.get('Retry-After') || '60';
+    throw new Error(`Write rate limited. Wait ${retryAfter}s.`);
+  }
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => '');
+    throw new Error(`API error: HTTP ${res.status} — ${errBody}`);
+  }
+  return res.json();
+}
+
 const server = new Server(
-  { name: 'irehab', version: '1.0.0' },
+  { name: 'irehab', version: '2.0.0' },
   { capabilities: { tools: {} } }
 );
 
@@ -95,6 +117,71 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'get_prom_overdue',
       description: '列出 PROM 問卷逾期待填的病人。',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'draft_prescription',
+      description: '為病人建立處方草稿。草稿需醫師在 Doctor PWA 確認後才會生效。建議先用 list_exercise_library 查詢可用 exerciseId。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          patientId: { type: 'string', description: '病人 ID' },
+          weekNumber: { type: 'number', description: '週數' },
+          phase: { type: 'number', description: '復健階段 (1-4)', minimum: 1, maximum: 4 },
+          exercises: {
+            type: 'array',
+            minItems: 1,
+            description: '處方運動列表',
+            items: {
+              type: 'object',
+              properties: {
+                exerciseId: { type: 'string' },
+                sets: { type: 'number', minimum: 1 },
+                reps: { type: 'number', minimum: 1 },
+                holdSec: { type: 'number', minimum: 0 },
+                frequency: { type: 'string' },
+                notes: { type: 'string', maxLength: 500 },
+              },
+              required: ['exerciseId', 'sets', 'reps', 'frequency'],
+            },
+          },
+          notes: { type: 'string', maxLength: 1000 },
+        },
+        required: ['patientId', 'exercises'],
+      },
+    },
+    {
+      name: 'draft_assessment',
+      description: '為病人建立評估草稿。草稿需醫師在 Doctor PWA 確認後才生效。建議先用 get_patient_trends 和 get_episode_snapshot 查詢病人近期狀態。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          patientId: { type: 'string', description: '病人 ID' },
+          phase: { type: 'number', description: '復健階段 (1-4)', minimum: 1, maximum: 4 },
+          rom: {
+            type: 'object',
+            properties: {
+              kneeFlexion: { type: 'number', minimum: 0, maximum: 180 },
+              kneeExtension: { type: 'number', minimum: -30, maximum: 30 },
+              measurementMethod: { type: 'string', enum: ['goniometer', 'visual_estimate', 'digital'] },
+            },
+          },
+          painVAS: { type: 'number', description: '0-10', minimum: 0, maximum: 10 },
+          effusionGrade: { type: 'string', enum: ['none', 'trace', 'mild', 'moderate', 'severe'] },
+          progressionDecision: { type: 'string', enum: ['advance', 'maintain', 'regress'] },
+          progressionRationale: { type: 'string', maxLength: 1000 },
+          subjectiveNotes: { type: 'string', maxLength: 2000 },
+          objectiveNotes: { type: 'string', maxLength: 2000 },
+          assessmentNotes: { type: 'string', maxLength: 2000 },
+          planNotes: { type: 'string', maxLength: 2000 },
+          setting: { type: 'string', enum: ['clinic', 'telehealth'] },
+        },
+        required: ['patientId', 'phase', 'progressionDecision'],
+      },
+    },
+    {
+      name: 'list_exercise_library',
+      description: '列出可用的運動庫，用於建立處方時選擇正確的 exerciseId。',
       inputSchema: { type: 'object', properties: {} },
     },
   ],
@@ -170,6 +257,75 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           .filter(p => p.promStatus === 'pending')
           .map(sanitizePatient);
         return { content: [{ type: 'text', text: JSON.stringify(overdue, null, 2) }] };
+      }
+
+      case 'draft_prescription': {
+        const pid = args.patientId;
+        // Preflight: find active episode
+        const epData = await apiCall(`/api/irehab/rehab/episodes?patientId=${pid}`);
+        const episodes = epData.episodes || [];
+        const active = episodes.find(e => e.status === 'active' || e.status === 'prehab');
+        if (!active) throw new Error('No active episode found for this patient.');
+
+        const body = {
+          phase: args.phase || active.currentPhase || 1,
+          weekNumber: args.weekNumber || 1,
+          exercises: (args.exercises || []).map(ex => ({
+            exerciseId: ex.exerciseId,
+            sets: ex.sets,
+            reps: ex.reps,
+            holdSec: ex.holdSec || 0,
+            frequency: ex.frequency,
+            notes: ex.notes || '',
+          })),
+        };
+        if (args.notes) body.notes = args.notes;
+
+        const result = await apiWrite(`/api/irehab/rehab/prescription?episodeId=${active.id}`, 'POST', body);
+        return { content: [{ type: 'text', text: JSON.stringify({
+          status: 'draft_created',
+          draftId: result.rxId,
+          episodeId: active.id,
+          requiresClinicianConfirmation: true,
+          message: '處方草稿已建立，等待醫師在 Doctor PWA 確認。',
+        }, null, 2) }] };
+      }
+
+      case 'draft_assessment': {
+        const pid = args.patientId;
+        const epData = await apiCall(`/api/irehab/rehab/episodes?patientId=${pid}`);
+        const episodes = epData.episodes || [];
+        const active = episodes.find(e => e.status === 'active' || e.status === 'prehab');
+        if (!active) throw new Error('No active episode found for this patient.');
+
+        const body = {
+          phase: args.phase,
+          date: new Date().toISOString().split('T')[0],
+          setting: args.setting || 'telehealth',
+          progressionDecision: args.progressionDecision,
+        };
+        if (args.rom) body.rom = args.rom;
+        if (args.painVAS != null) body.painVAS = args.painVAS;
+        if (args.effusionGrade) body.effusionGrade = args.effusionGrade;
+        if (args.progressionRationale) body.progressionRationale = args.progressionRationale;
+        if (args.subjectiveNotes) body.subjectiveNotes = args.subjectiveNotes;
+        if (args.objectiveNotes) body.objectiveNotes = args.objectiveNotes;
+        if (args.assessmentNotes) body.assessmentNotes = args.assessmentNotes;
+        if (args.planNotes) body.planNotes = args.planNotes;
+
+        const result = await apiWrite(`/api/irehab/rehab/assessment?episodeId=${active.id}`, 'POST', body);
+        return { content: [{ type: 'text', text: JSON.stringify({
+          status: 'draft_created',
+          draftId: result.assessmentId,
+          episodeId: active.id,
+          requiresClinicianConfirmation: true,
+          message: '評估草稿已建立，等待醫師在 Doctor PWA 確認。',
+        }, null, 2) }] };
+      }
+
+      case 'list_exercise_library': {
+        const data = await apiCall('/api/irehab/rehab/exercises');
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
       }
 
       default:
