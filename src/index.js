@@ -63,7 +63,7 @@ async function apiWrite(path, method, body) {
 }
 
 const server = new Server(
-  { name: 'irehab', version: '2.0.0' },
+  { name: 'irehab', version: '2.1.0' },
   { capabilities: { tools: {} } }
 );
 
@@ -183,6 +183,54 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: 'list_exercise_library',
       description: '列出可用的運動庫，用於建立處方時選擇正確的 exerciseId。',
       inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'draft_surgical_record',
+      description: '為病人建立術式紀錄草稿（§A 手術資訊 + §B 植入物 + §C 使用醫材 + §D 出院資訊）。草稿需醫師在 Doctor PWA 確認後才成為正式紀錄。建議先用 get_episode_snapshot 查詢病人的 procedure/laterality/surgeryDate。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          patientId: { type: 'string', description: '病人 ID' },
+          // §A Surgery Info
+          surgicalApproach: { type: 'string', enum: ['posterior', 'anterior', 'DAA', 'lateral', 'medial_parapatellar', 'anterolateral', 'direct_lateral', 'posterolateral', 'Hardinge'] },
+          fixationType: { type: 'string', enum: ['cemented', 'uncemented', 'hybrid', 'reverse_hybrid'] },
+          anesthesiaType: { type: 'string', enum: ['general', 'spinal', 'epidural', 'regional_block'] },
+          asaGrade: { type: 'number', minimum: 1, maximum: 5 },
+          procedureSubtype: { type: 'string', enum: ['primary_elective', 'fracture_related', 'revision'] },
+          diagnosis: { type: 'string', enum: ['OA', 'AVN', 'fracture', 'RA', 'dysplasia', 'other'] },
+          navigationAssisted: { type: 'boolean' },
+          robotSystem: { type: 'string', enum: ['MAKO', 'ROSA', 'NAVIO', ''] },
+          // §B Implants
+          implants: { type: 'array', items: { type: 'object', properties: { component: { type: 'string', enum: ['femoral', 'tibial', 'patellar', 'acetabular', 'femoral_head', 'liner', 'stem'] }, manufacturer: { type: 'string' }, model: { type: 'string' }, size: { type: 'string' }, lotNumber: { type: 'string' }, fixation: { type: 'string', enum: ['cemented', 'uncemented'] } }, required: ['component', 'manufacturer', 'model'] } },
+          // §C Intraop Materials
+          intraopMaterials: { type: 'array', items: { type: 'object', properties: { productName: { type: 'string' }, brand: { type: 'string' }, category: { type: 'string' }, quantity: { type: 'number', minimum: 1 } }, required: ['productName', 'quantity'] } },
+          // §D Discharge
+          losNights: { type: 'number', minimum: 0, maximum: 365 },
+          dischargeDisposition: { type: 'string', enum: ['home', 'snf', 'inpatient_rehab', 'ltac', 'other'] },
+          dischargeAmbulation: { type: 'string', enum: ['independent', 'cane', 'walker', 'wheelchair', 'non_ambulatory'] },
+          pod1Mobilization: { type: 'boolean' },
+          // §F Optional
+          operativeTimeMinutes: { type: 'number', minimum: 0 },
+          estimatedBloodLossMl: { type: 'number', minimum: 0 },
+          vteProphylaxis: { type: 'string', maxLength: 200 },
+          transfusion: { type: 'boolean' },
+        },
+        required: ['patientId'],
+      },
+    },
+    {
+      name: 'draft_billing',
+      description: '為病人建立自費計費紀錄草稿。支援用品名搜尋產品。草稿需醫師在 Doctor PWA 確認後才正式記錄。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          patientId: { type: 'string' },
+          items: { type: 'array', minItems: 1, maxItems: 10, items: { type: 'object', properties: { productName: { type: 'string' }, nhiCode: { type: 'string' }, quantity: { type: 'number', minimum: 1, default: 1 }, unitPrice: { type: 'number' }, note: { type: 'string', maxLength: 500 } }, required: ['productName', 'quantity'] } },
+          hospitalContext: { type: 'string' },
+          nhiOnly: { type: 'boolean' },
+        },
+        required: ['patientId', 'items'],
+      },
     },
   ],
 }));
@@ -326,6 +374,177 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'list_exercise_library': {
         const data = await apiCall('/api/irehab/rehab/exercises');
         return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      }
+
+      case 'draft_surgical_record': {
+        const pid = args.patientId;
+        // Preflight: find active episode
+        const epData = await apiCall(`/api/irehab/rehab/episodes?patientId=${pid}`);
+        const episodes = epData.episodes || [];
+        const active = episodes.find(e => e.status === 'active' || e.status === 'prehab');
+        if (!active) throw new Error('No active episode found for this patient.');
+
+        // Build payload with all provided fields
+        const body = {};
+        // §A Surgery Info
+        if (args.surgicalApproach) body.surgicalApproach = args.surgicalApproach;
+        if (args.fixationType) body.fixationType = args.fixationType;
+        if (args.anesthesiaType) body.anesthesiaType = args.anesthesiaType;
+        if (args.asaGrade != null) body.asaGrade = args.asaGrade;
+        if (args.procedureSubtype) body.procedureSubtype = args.procedureSubtype;
+        if (args.diagnosis) body.diagnosis = args.diagnosis;
+        if (args.navigationAssisted != null) body.navigationAssisted = args.navigationAssisted;
+        if (args.robotSystem != null) body.robotSystem = args.robotSystem;
+        // §B Implants
+        if (args.implants) body.implants = args.implants;
+        // §C Intraop Materials
+        if (args.intraopMaterials) body.intraopMaterials = args.intraopMaterials;
+        // §D Discharge
+        if (args.losNights != null) body.losNights = args.losNights;
+        if (args.dischargeDisposition) body.dischargeDisposition = args.dischargeDisposition;
+        if (args.dischargeAmbulation) body.dischargeAmbulation = args.dischargeAmbulation;
+        if (args.pod1Mobilization != null) body.pod1Mobilization = args.pod1Mobilization;
+        // §F Optional
+        if (args.operativeTimeMinutes != null) body.operativeTimeMinutes = args.operativeTimeMinutes;
+        if (args.estimatedBloodLossMl != null) body.estimatedBloodLossMl = args.estimatedBloodLossMl;
+        if (args.vteProphylaxis) body.vteProphylaxis = args.vteProphylaxis;
+        if (args.transfusion != null) body.transfusion = args.transfusion;
+
+        // Track missing required fields
+        const missingRequiredFields = [];
+        if (!args.surgicalApproach) missingRequiredFields.push('surgicalApproach');
+        if (!args.fixationType) missingRequiredFields.push('fixationType');
+        if (!args.implants || args.implants.length === 0) missingRequiredFields.push('implants');
+        if (args.losNights == null) missingRequiredFields.push('losNights');
+        if (!args.dischargeDisposition) missingRequiredFields.push('dischargeDisposition');
+
+        // Track missing recommended fields
+        const missingRecommendedFields = [];
+        if (args.implants && args.implants.length > 0) {
+          const missingLot = args.implants.some(imp => !imp.lotNumber);
+          if (missingLot) missingRecommendedFields.push('lotNumber (some implants)');
+        }
+        if (args.estimatedBloodLossMl == null) missingRecommendedFields.push('estimatedBloodLossMl');
+        if (args.operativeTimeMinutes == null) missingRecommendedFields.push('operativeTimeMinutes');
+        if (!args.anesthesiaType) missingRecommendedFields.push('anesthesiaType');
+
+        const result = await apiWrite(`/api/irehab/episode/${active.id}/surgical-record`, 'POST', body);
+        return { content: [{ type: 'text', text: JSON.stringify({
+          status: 'draft_created',
+          draftId: result.surgicalRecordId,
+          episodeId: active.id,
+          missingRequiredFields,
+          missingRecommendedFields,
+          requiresClinicianConfirmation: true,
+          message: '術式紀錄草稿已建立，等待醫師在 Doctor PWA 確認。',
+        }, null, 2) }] };
+      }
+
+      case 'draft_billing': {
+        const pid = args.patientId;
+        // Preflight: find active episode
+        const epData = await apiCall(`/api/irehab/rehab/episodes?patientId=${pid}`);
+        const episodes = epData.episodes || [];
+        const active = episodes.find(e => e.status === 'active' || e.status === 'prehab');
+        if (!active) throw new Error('No active episode found for this patient.');
+
+        const hospitalContext = args.hospitalContext || '';
+        const itemResults = [];
+
+        // For each item: search products via BFF, apply confidence threshold
+        for (const item of args.items) {
+          const query = item.nhiCode || item.productName;
+          let searchUrl = `/api/irehab/billing/products/search?q=${encodeURIComponent(query)}`;
+          if (hospitalContext) searchUrl += `&hospitalId=${encodeURIComponent(hospitalContext)}`;
+          if (args.nhiOnly) searchUrl += `&nhiOnly=true`;
+
+          let matched = null;
+          let matchStatus = 'manual_required';
+          try {
+            const searchResult = await apiCall(searchUrl);
+            const candidates = searchResult.products || [];
+
+            if (candidates.length > 0) {
+              const top = candidates[0];
+              const isExactMatch = top.matchStrategy === 'exact_nhi' || top.matchStrategy === 'exact_name';
+              const isHighConfidence = top.matchConfidence >= 0.85 && candidates.length <= 3;
+
+              if (isExactMatch || isHighConfidence) {
+                matched = {
+                  productId: top.productId,
+                  productName: top.productName,
+                  nhiCode: top.nhiCode || null,
+                  unitPrice: item.unitPrice || top.unitPrice,
+                  matchStrategy: top.matchStrategy,
+                  matchConfidence: top.matchConfidence,
+                };
+                matchStatus = 'auto_matched';
+              } else {
+                matched = {
+                  productName: item.productName,
+                  unitPrice: item.unitPrice || null,
+                  candidateCount: candidates.length,
+                  topCandidate: { productId: top.productId, productName: top.productName, matchConfidence: top.matchConfidence },
+                };
+                matchStatus = 'ambiguous';
+              }
+            }
+          } catch (searchErr) {
+            matched = { productName: item.productName, unitPrice: item.unitPrice || null, error: searchErr.message };
+            matchStatus = 'search_failed';
+          }
+
+          itemResults.push({
+            requestedName: item.productName,
+            quantity: item.quantity,
+            note: item.note || '',
+            matchStatus,
+            matched,
+          });
+        }
+
+        // Build billing record payload
+        const billingItems = itemResults
+          .filter(ir => ir.matchStatus === 'auto_matched')
+          .map(ir => ({
+            productId: ir.matched.productId,
+            productName: ir.matched.productName,
+            nhiCode: ir.matched.nhiCode,
+            quantity: ir.quantity,
+            unitPrice: ir.matched.unitPrice,
+            note: ir.note,
+          }));
+
+        let billingResult = null;
+        if (billingItems.length > 0) {
+          billingResult = await apiWrite('/api/irehab/billing/record', 'POST', {
+            episodeId: active.id,
+            patientId: pid,
+            hospitalContext,
+            items: billingItems,
+          });
+        }
+
+        const autoMatchedCount = itemResults.filter(ir => ir.matchStatus === 'auto_matched').length;
+        const ambiguousCount = itemResults.filter(ir => ir.matchStatus === 'ambiguous').length;
+        const failedCount = itemResults.filter(ir => ir.matchStatus === 'manual_required' || ir.matchStatus === 'search_failed').length;
+
+        return { content: [{ type: 'text', text: JSON.stringify({
+          status: billingResult ? 'draft_created' : 'no_items_matched',
+          billingRecordId: billingResult?.billingRecordId || null,
+          episodeId: active.id,
+          summary: {
+            totalItems: args.items.length,
+            autoMatched: autoMatchedCount,
+            ambiguous: ambiguousCount,
+            manualRequired: failedCount,
+          },
+          itemResults,
+          requiresClinicianConfirmation: true,
+          message: billingResult
+            ? '自費計費草稿已建立，等待醫師在 Doctor PWA 確認。'
+            : '未能自動匹配任何品項，請在 Doctor PWA 手動選取產品。',
+        }, null, 2) }] };
       }
 
       default:
