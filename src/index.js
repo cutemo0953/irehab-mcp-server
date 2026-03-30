@@ -6,6 +6,7 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprot
 
 const API_BASE = process.env.IREHAB_API_BASE || 'https://www2.denovortho.com';
 const API_TOKEN = process.env.IREHAB_API_TOKEN;
+const ADMIN_KEY = process.env.IREHAB_ADMIN_KEY || '';
 
 if (!API_TOKEN) {
   console.error('Error: IREHAB_API_TOKEN environment variable is required.');
@@ -62,8 +63,24 @@ async function apiWrite(path, method, body) {
   return res.json();
 }
 
+async function adminApiCall(path) {
+  if (!ADMIN_KEY) {
+    throw new Error('IREHAB_ADMIN_KEY not set. Admin analytics tools require the admin API key.');
+  }
+  const res = await fetch(`${API_BASE}${path}`, {
+    headers: { 'X-API-Key': ADMIN_KEY },
+  });
+  if (res.status === 401) {
+    throw new Error('Unauthorized. Check your IREHAB_ADMIN_KEY.');
+  }
+  if (!res.ok) {
+    throw new Error(`API error: HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
 const server = new Server(
-  { name: 'irehab', version: '2.1.0' },
+  { name: 'irehab', version: '2.2.0' },
   { capabilities: { tools: {} } }
 );
 
@@ -231,6 +248,32 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         required: ['patientId', 'items'],
       },
+    },
+    // ── Customer Intelligence Tools (Admin, read-only) ──
+    {
+      name: 'get_invite_stats',
+      description: '查詢邀請碼統計：近 30 天申請數、來源分佈、醫院分佈、轉換率、待使用邀請碼數。需要 IREHAB_ADMIN_KEY。',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'get_user_activity',
+      description: '查詢用戶活動概況：醫師/病患總數、7/30 天活躍數、新註冊數、VAS 回報數。需要 IREHAB_ADMIN_KEY。',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'get_churn_risk',
+      description: '查詢流失風險：列出 N 天內未活動的醫師和病患。預設 7 天。需要 IREHAB_ADMIN_KEY。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          days: { type: 'number', description: '不活躍天數門檻（預設 7）', default: 7 },
+        },
+      },
+    },
+    {
+      name: 'get_customer_summary',
+      description: '一鍵查詢客戶全貌：邀請碼、用戶活動、WishPool 排行、活躍 episode 數。需要 IREHAB_ADMIN_KEY。',
+      inputSchema: { type: 'object', properties: {} },
     },
   ],
 }));
@@ -545,6 +588,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             ? '自費計費草稿已建立，等待醫師在 Doctor PWA 確認。'
             : '未能自動匹配任何品項，請在 Doctor PWA 手動選取產品。',
         }, null, 2) }] };
+      }
+
+      // ── Customer Intelligence Tools ──
+
+      case 'get_invite_stats': {
+        const data = await adminApiCall('/api/irehab/admin/analytics/invites');
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      }
+
+      case 'get_user_activity': {
+        const data = await adminApiCall('/api/irehab/admin/analytics/activity');
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      }
+
+      case 'get_churn_risk': {
+        const days = args.days || 7;
+        const data = await adminApiCall(`/api/irehab/admin/analytics/churn?days=${days}`);
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      }
+
+      case 'get_customer_summary': {
+        const data = await adminApiCall('/api/irehab/admin/analytics/summary');
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
       }
 
       default:
